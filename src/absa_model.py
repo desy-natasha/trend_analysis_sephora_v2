@@ -11,6 +11,7 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
+import os
 from transformers import logging as hf_logging
 from tqdm import tqdm
 from unittest.mock import patch
@@ -19,7 +20,7 @@ from unittest.mock import patch
 hf_logging.set_verbosity_error()
 hf_logging.disable_progress_bar()
 warnings.filterwarnings("ignore",message="Precision is ill-defined",category=UserWarning)
-tqdm.__init__ = lambda *args, **kwargs: None
+os.environ["TQDM_DISABLE"] = "1"
 
 ### CONSTANTS ###
 
