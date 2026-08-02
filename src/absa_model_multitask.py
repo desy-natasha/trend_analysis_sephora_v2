@@ -37,6 +37,13 @@ ASPECTS = [
     "Packaging & Size",
 ]
 
+BACKBONE_CONFIG = {
+    "bert-base-uncased"                  : ("bert",    12),
+    "roberta-base"                       : ("roberta", 12),
+    "microsoft/deberta-v3-base"          : ("deberta", 12),
+    "yangheng/deberta-v3-base-absa-v1.1" : ("deberta", 12),
+}
+
 BASELINE_LABEL_MAP = {"Positive": "positive", "Negative": "negative", "Neutral": "neutral"}
 FINETUNE_LABELS    = ["positive", "negative", "neutral", "not_mentioned"]
 LABEL2ID           = {l: i for i, l in enumerate(FINETUNE_LABELS)}
@@ -50,39 +57,53 @@ N_DEBERTA_LAYERS = 12
 
 class ABSADataset(Dataset):
     def __init__(self, df, tokenizer,
+                 backbone,
                  text_col="cleaned_review_text",
                  label_col="label",
                  aspect_col="aspect",
                  max_length=512):
         self.tokenizer  = tokenizer
         self.max_length = max_length
+        self.backbone   = backbone
         self.labels     = df[label_col].map(LABEL2ID).tolist()
-        self.inputs     = [
-            f"[ASPECT]{row[aspect_col]}[SEP]{row[text_col]}"
+        self.pairs      = [
+            (row[aspect_col], row[text_col])
             for _, row in df.iterrows()
         ]
 
     def __len__(self):
-        return len(self.inputs)
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        enc = self.tokenizer(
-            self.inputs[idx],
-            max_length     = self.max_length,
-            padding        = "max_length",
-            truncation     = True,
-            return_tensors = "pt",
-        )
+        aspect, text = self.pairs[idx]
+
+        if "absa" in self.backbone.lower():
+            enc = self.tokenizer(
+                f"[ASPECT]{aspect}[SEP]{text}",
+                max_length     = self.max_length,
+                padding        = "max_length",
+                truncation     = True,
+                return_tensors = "pt",
+            )
+        else:
+            enc = self.tokenizer(
+                aspect,
+                text,
+                max_length     = self.max_length,
+                padding        = "max_length",
+                truncation     = True,
+                return_tensors = "pt",
+            )
+
         return {
             "input_ids":      enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
             "label":          torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
-
 ### DEFINE MODEL ###
 
-def build_model(n_unfreeze: int):
+def build_model(backbone: str, n_unfreeze: int):
     """Load pretrained model and replace the 3-class head with a 4-class head.
 
     n_unfreeze =  0    head + pooler only
@@ -90,11 +111,12 @@ def build_model(n_unfreeze: int):
     n_unfreeze = -1    full model (all layers)
     """
     model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
+        backbone,
         num_labels              = len(FINETUNE_LABELS),
         id2label                = ID2LABEL,
         label2id                = LABEL2ID,
         ignore_mismatched_sizes = True,
+        torch_dtype             = torch.float32, 
     )
 
     if n_unfreeze == -1:
@@ -108,12 +130,16 @@ def build_model(n_unfreeze: int):
     # Always unfreeze head + pooler
     for param in model.classifier.parameters():
         param.requires_grad = True
-    for param in model.pooler.parameters():
-        param.requires_grad = True
+
+    if hasattr(model, "pooler") and model.pooler is not None:
+        for param in model.pooler.parameters():
+            param.requires_grad = True
 
     # Unfreeze top N transformer layers
     if n_unfreeze > 0:
-        for layer in model.deberta.encoder.layer[-n_unfreeze:]:
+        encoder_attr = BACKBONE_CONFIG[backbone][0]
+        encoder      = getattr(model, encoder_attr)
+        for layer in encoder.encoder.layer[-n_unfreeze:]:
             for param in layer.parameters():
                 param.requires_grad = True
 
@@ -123,19 +149,18 @@ def build_model(n_unfreeze: int):
 
     return model
 
-
 ### OPTIMIZER ###
 
-def get_optimizer(model, base_lr, decay_rate, head_lr_mult):
+def get_optimizer(model, backbone, base_lr, decay_rate, head_lr_mult):
     """
     Assign different learning rates per layer
     1. Classification head + pooler : base_lr * head_lr_mult (highest, randomly initialised)
     2. Transformer layers           : base_lr * decay_rate^(distance from top) (lower = smaller LR)
     3. Everything else              : base_lr
     """
-
+    n_layers     = BACKBONE_CONFIG[backbone][1]
     head_params  = []
-    layer_params = [[] for _ in range(N_DEBERTA_LAYERS)]
+    layer_params = [[] for _ in range(n_layers)]
     other_params = []
 
     for name, param in model.named_parameters():
@@ -145,7 +170,7 @@ def get_optimizer(model, base_lr, decay_rate, head_lr_mult):
             head_params.append(param)
         else:
             matched = False
-            for i in range(N_DEBERTA_LAYERS):
+            for i in range(n_layers):
                 if f"encoder.layer.{i}." in name:
                     layer_params[i].append(param)
                     matched = True
@@ -156,13 +181,12 @@ def get_optimizer(model, base_lr, decay_rate, head_lr_mult):
     param_groups = [{"params": head_params, "lr": base_lr * head_lr_mult}]
     for i, params in enumerate(layer_params):
         if params:
-            layer_lr = base_lr * (decay_rate ** (N_DEBERTA_LAYERS - i))
+            layer_lr = base_lr * (decay_rate ** (n_layers - i))
             param_groups.append({"params": params, "lr": layer_lr})
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr})
 
     return torch.optim.AdamW(param_groups, weight_decay=0.01)
-
 
 ### EVALUATION ###
 
@@ -195,7 +219,6 @@ def evaluate(model, loader, device, criterion=None):
 
     return avg_loss, report, cm, all_preds, all_labels
 
-
 def print_metrics(report):
 
     for label in FINETUNE_LABELS:
@@ -206,7 +229,6 @@ def print_metrics(report):
     print(f"\n  Macro F1  : {report['macro avg']['f1-score']:.4f}")
     print(f"  Accuracy  : {report['accuracy']:.4f}")
 
-
 def plot_confusion_matrix(cm, title="Confusion matrix"):
     fig, ax = plt.subplots(figsize=(7, 5))
     sns.heatmap(pd.DataFrame(cm, index=FINETUNE_LABELS, columns=FINETUNE_LABELS),
@@ -216,7 +238,6 @@ def plot_confusion_matrix(cm, title="Confusion matrix"):
     ax.set_xlabel("Predicted label")
     plt.tight_layout()
     plt.show()
-
 
 ### BASELINE FUNCTION ###
 
@@ -300,7 +321,6 @@ def run_baseline(val_df,
 
     return pred_df, sweep_df
 
-
 ### FINE-TUNE FUNCTION ###
 
 def compute_class_weights(train_df, label_col='label'):
@@ -315,6 +335,7 @@ def compute_class_weights(train_df, label_col='label'):
     return weights
     
 def run_finetune(train_df, val_df,
+                 backbone     = "yangheng/deberta-v3-base-absa-v1.1",
                  text_col     = "cleaned_review_text",
                  label_col    = "label",
                  aspect_col   = "aspect",
@@ -332,22 +353,22 @@ def run_finetune(train_df, val_df,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n FINE TUNING: n_unfreeze={n_unfreeze} | device={device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model     = build_model(n_unfreeze).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(backbone)
+    model     = build_model(backbone, n_unfreeze).to(device)
 
-    train_ds = ABSADataset(train_df, tokenizer, text_col=text_col, label_col=label_col, aspect_col=aspect_col)
-    val_ds   = ABSADataset(val_df, tokenizer, text_col=text_col, label_col=label_col, aspect_col=aspect_col)
+    train_ds = ABSADataset(train_df, tokenizer, backbone=backbone, text_col=text_col, label_col=label_col, aspect_col=aspect_col)
+    val_ds   = ABSADataset(val_df, tokenizer, backbone=backbone, text_col=text_col, label_col=label_col, aspect_col=aspect_col)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=2, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size * 2, shuffle=False, num_workers=2, pin_memory=True)
 
-    optimizer   = get_optimizer(model, base_lr=lr, decay_rate=decay_rate, head_lr_mult=head_lr_mult)
+    optimizer   = get_optimizer(model, backbone=backbone,base_lr=lr, decay_rate=decay_rate, head_lr_mult=head_lr_mult)
     total_steps = len(train_loader) * epochs
     scheduler   = get_linear_schedule_with_warmup(optimizer,
                                                   num_warmup_steps   = int(0.1 * total_steps),
                                                   num_training_steps = total_steps)
 
-    class_weights = compute_class_weights(train_df).to(device)
+    class_weights = compute_class_weights(train_df).to(device, dtype=torch.float32)
     criterion     = nn.CrossEntropyLoss(weight=class_weights)
 
     out = Path(output_dir)
@@ -355,8 +376,10 @@ def run_finetune(train_df, val_df,
 
     best_val_loss  = float("inf")
     patience_count = 0
+    best_epoch     = 0
     history        = []
-    ckpt_path      = out / f"best_model_unfreeze{n_unfreeze}"
+    safe_name = backbone.replace("/", "_")
+    ckpt_path = out / f"best_model_{safe_name}_unfreeze{n_unfreeze}"
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -393,12 +416,13 @@ def run_finetune(train_df, val_df,
 
         if val_loss < best_val_loss:
             best_val_loss  = val_loss
+            best_epoch = epoch
             patience_count = 0
             hf_logging.disable_progress_bar()
             model.save_pretrained(ckpt_path)
             hf_logging.enable_progress_bar()
             tokenizer.save_pretrained(ckpt_path)
-            print(f"  Saved best checkpoint to {ckpt_path}")
+            # print(f"  Saved best checkpoint to {ckpt_path}")
         else:
             patience_count += 1
             print(f"  No improvement ({patience_count}/{patience})")
@@ -406,10 +430,64 @@ def run_finetune(train_df, val_df,
                 print("  Early stopping.")
                 break
 
-    print(f"\nLoading best checkpoint for final evaluation")
+    print(f"\nLoading best checkpoint from epoch {best_epoch} with val_loss={best_val_loss:.4f}")
     best_model = AutoModelForSequenceClassification.from_pretrained(ckpt_path).to(device)
     _, report, cm, _, _ = evaluate(best_model, val_loader, device, criterion=criterion)
     print_metrics(report)
     plot_confusion_matrix(cm, title=f"Fine-tune  n_unfreeze={n_unfreeze}")
 
     return best_model, pd.DataFrame(history)
+
+### LOAD TRAINED MODEL ###
+
+def load_trained_model(backbone, output_dir="outputs", n_unfreeze=0, checkpoint_path=None):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if checkpoint_path is None:
+        safe_name = backbone.replace("/", "_")
+        checkpoint_path = Path(output_dir) / f"best_model_{safe_name}_unfreeze{n_unfreeze}"
+
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
+
+    print(f"Loading checkpoint: {checkpoint_path}")
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    model     = AutoModelForSequenceClassification.from_pretrained(checkpoint_path).to(device)
+    model.eval()
+
+    return model, tokenizer, device
+
+def evaluate_trained_model(df, backbone,
+                           output_dir   = "outputs",
+                           n_unfreeze   = 0,
+                           checkpoint_path = None,
+                           text_col     = "cleaned_review_text",
+                           label_col    = "label",
+                           aspect_col   = "aspect",
+                           batch_size   = 32,
+                           plot_title   = None):
+
+    model, tokenizer, device = load_trained_model(
+        backbone, output_dir=output_dir, n_unfreeze=n_unfreeze, checkpoint_path=checkpoint_path
+    )
+
+    ds     = ABSADataset(df, tokenizer, backbone=backbone, text_col=text_col, label_col=label_col, aspect_col=aspect_col)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+    loss, report, cm, preds, labels = evaluate(model, loader, device)
+
+    print(f"\nEvaluation: {backbone}  (n_unfreeze={n_unfreeze}) ===")
+    print(f"  Eval loss : {loss:.4f}")
+    print_metrics(report)
+    plot_confusion_matrix(cm, title=plot_title or f"{backbone}  n_unfreeze={n_unfreeze}")
+
+    return {
+        "backbone": backbone,
+        "loss": loss,
+        "report": report,
+        "confusion_matrix": cm,
+        "preds": preds,
+        "labels": labels,
+    }
